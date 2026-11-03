@@ -701,17 +701,32 @@ function draftData(metric,kind='rookie'){
       picks.push({start:d.start||0,season:d.season,round:p.r,no:p.no,label:db?.label||`${p.r}.${p.no}`,rid:p.rid,orig:db?.orig,pid:p.pid,tot,own,wk,ppw:wk?tot/wk:0,pos:P(p.pid)[1]});
     }
   }
-  // slot benchmark: least squares of points per week on log(overall pick)
-  const fit=picks.filter(x=>x.wk>=1);let a=0,b=0;
-  if(fit.length>=8){
-    const xs=fit.map(x=>Math.log(x.no)),ys=fit.map(x=>x.ppw),n=xs.length;
-    const mx=xs.reduce((s,v)=>s+v,0)/n,my=ys.reduce((s,v)=>s+v,0)/n;
-    const sxy=xs.reduce((s,v,i)=>s+(v-mx)*(ys[i]-my),0),sxx=xs.reduce((s,v)=>s+(v-mx)**2,0);
-    b=sxx?sxy/sxx:0;a=my-b*mx;
-  }else if(fit.length){a=fit.reduce((s,x)=>s+x.ppw,0)/fit.length}
-  const expOf=no=>Math.max(0,a+b*Math.log(no));
-  for(const x of picks){x.exp=expOf(x.no);x.voe=x.wk?x.ppw-x.exp:0;x.voeTot=x.voe*x.wk}
+  // slot benchmark: kernel-weighted local linear fit over overall pick number.
+  // Each pick is left out of its own benchmark, and picks with more weeks of data count more.
   const teams=Math.max(...drafts.map(d=>Number(d.teams)||0),D.frs.length);
+  const fit=picks.filter(x=>x.wk>=1);
+  const bw=Math.max(2,teams/2);
+  const localLin=(no,skip)=>{
+    let sw=0,sx=0,sy=0,sxx=0,sxy=0,hi=0;
+    for(const q of fit){
+      if(q===skip) continue;
+      const d=q.no-no,w=Math.exp(-0.5*(d/bw)**2)*Math.min(q.wk,34);
+      if(w<1e-6) continue;
+      sw+=w;sx+=w*d;sy+=w*q.ppw;sxx+=w*d*d;sxy+=w*d*q.ppw;
+      if(Math.abs(d)<=bw*2) hi=Math.max(hi,q.ppw);
+    }
+    if(!sw) return 0;
+    const mx=sx/sw,my=sy/sw,vx=sxx/sw-mx*mx,b=vx>1e-9?(sxy/sw-mx*my)/vx:0;
+    return Math.min(hi,Math.max(0,my-b*mx));
+  };
+  // force the curve to never rise at a later slot (pool adjacent violators)
+  const N=Math.max(1,...picks.map(x=>x.no));
+  const full=range(1,N).map(n=>localLin(n,null));
+  const blocks=[];
+  for(let i=0;i<full.length;i++){blocks.push({v:full[i],n:1});while(blocks.length>1&&blocks[blocks.length-2].v<blocks[blocks.length-1].v){const t=blocks.pop(),u=blocks.pop();blocks.push({v:(u.v*u.n+t.v*t.n)/(u.n+t.n),n:u.n+t.n})}}
+  const iso=[];for(const bl of blocks) for(let k=0;k<bl.n;k++) iso.push(bl.v);
+  const expOf=no=>iso[Math.min(N,Math.max(1,no))-1]||0;
+  for(const x of picks){x.exp=Math.max(0,localLin(x.no,x)+expOf(x.no)-full[x.no-1]);x.voe=x.wk?x.ppw-x.exp:0;x.voeTot=x.voe*x.wk}
   return D.prodMemo[key]={picks,drafts,expOf,teams,rounds:Math.max(0,...picks.map(x=>x.round))};
 }
 function renderDraft(){
