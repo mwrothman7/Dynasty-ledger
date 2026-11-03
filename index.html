@@ -118,6 +118,7 @@ td.r,th.r{text-align:right}
 .matrix th.rowh{text-align:left;position:sticky;left:0;background:var(--sunk);z-index:1}
 .cell{border:0;border-radius:4px;padding:6px 8px;min-width:58px;font:500 13px/1 var(--mono);background:var(--sunk)}
 .cell.sel{outline:2px solid var(--ink)}
+.cell .cn{font-size:10px;color:var(--muted)}
 .cell.self{background:none;color:var(--line);cursor:default}
 
 /* h2h */
@@ -200,6 +201,8 @@ td.r,th.r{text-align:right}
     <button class="tab" role="tab" data-view="trades">Trades</button>
     <button class="tab" role="tab" data-view="rank">Trade Rankings</button>
     <button class="tab" role="tab" data-view="wire">Waiver Wire</button>
+    <button class="tab" role="tab" data-view="draft">Rookie Drafts</button>
+    <button class="tab" role="tab" data-view="startup">Startup Draft</button>
     <button class="tab" role="tab" data-view="h2h">Head to Head</button>
     <button class="tab" role="tab" data-view="history">League History</button>
     <button class="tab" role="tab" data-view="week">This Week</button>
@@ -236,7 +239,7 @@ async function pool(items,n,fn){
 }
 
 let D=null, view='trades', liveTimer=null, loading=false;
-const ui={team:'',season:'',q:'',sort:'new',metric:'total',limit:40,a:null,b:null,wSeason:'',wTeam:''};
+const ui={team:'',season:'',q:'',sort:'new',metric:'total',limit:40,a:null,b:null,wSeason:'',wTeam:'',dSeason:'',dRound:'',dRank:'pw',sSeason:'',sRound:'',sTeam:'',sRank:'pw'};
 const prog={done:0,total:1,msg:''};
 
 function setStatus(msg,err){
@@ -245,8 +248,9 @@ function setStatus(msg,err){
 function tick(){prog.done++; if(prog.done%4===0||prog.done===prog.total) setStatus(prog.msg)}
 
 /* ---------- loading ---------- */
-async function loadPlayers(){
-  const c=store.get('slp_players');
+async function loadPlayers(season){
+  store.del('slp_players');
+  const c=store.get('slp_players2');
   if(c&&c.m&&Date.now()-c.t<864e5) return c.m;
   prog.msg='Downloading the NFL player list (cached for a day)...'; setStatus(prog.msg);
   try{
@@ -254,9 +258,9 @@ async function loadPlayers(){
     for(const [id,p] of Object.entries(raw||{})){
       const n=p.full_name||[p.first_name,p.last_name].filter(Boolean).join(' ');
       if(!n) continue;
-      m[id]=[n,p.position||(p.fantasy_positions||[])[0]||'',p.team||''];
+      m[id]=[n,p.position||(p.fantasy_positions||[])[0]||'',p.team||'',p.years_exp!=null?Number(season)-Number(p.years_exp):null];
     }
-    store.set('slp_players',{t:Date.now(),m}); return m;
+    store.set('slp_players2',{t:Date.now(),m}); return m;
   }catch(e){ return c?.m||{} }
 }
 
@@ -316,7 +320,7 @@ async function loadLeague(leagueId,quiet){
       chain.push(lg); id=lg.previous_league_id;
     }
     chain.reverse();
-    const players=await loadPlayers();
+    const players=await loadPlayers(state.season);
     prog.done=0;prog.total=chain.length*37;
     const seasons=[];
     for(const lg of chain){
@@ -400,6 +404,8 @@ function build(seasons,state,players){
   }
   const champs=seasons.map(s=>{const f=s.bracket.find(b=>b.p===1&&b.w!=null);return f?{season:s.season,w:f.w,l:f.l}:null}).filter(Boolean);
 
+  const weekKeys=[];
+  for(const s of seasons) for(const [w,arr] of Object.entries(s.matchups)){const k=Number(s.season)*100+Number(w);if(k<liveKey&&arr.some(m=>m.pts>0))weekKeys.push(k)}
   // starters index
   const st={};
   for(const s of seasons) for(const [w,arr] of Object.entries(s.matchups)){
@@ -457,7 +463,7 @@ function build(seasons,state,players){
   const holder={};
   for(const r of cur.rosters) for(const p of r.players) holder[p]=r.rid;
 
-  return {seasons,S,cur,frs,tname,games,champs,st,pickIndex,draftedBy,trades,playerTrades,pickTrades,moves,leaves,movesByPid,holder,players,names,state,prodMemo:{}};
+  return {seasons,S,cur,frs,tname,games,champs,st,pickIndex,draftedBy,trades,playerTrades,pickTrades,moves,leaves,movesByPid,weekKeys,holder,players,names,state,prodMemo:{}};
 }
 
 const P=pid=>D.players[pid]||D.names[pid]||[/^[A-Z]{2,3}$/.test(pid)?pid+' D/ST':'Player '+pid,/^[A-Z]{2,3}$/.test(pid)?'DEF':'',''];
@@ -675,6 +681,182 @@ function renderWire(){
   $('#wM').onchange=e=>{ui.metric=e.target.value;renderWire()};
 }
 
+function isRookieDraft(d){
+  const known=d.picks.filter(p=>p.pid&&D.players[p.pid]&&D.players[p.pid][3]!=null);
+  if(known.length>=3) return known.filter(p=>String(D.players[p.pid][3])===String(d.season)).length/known.length>=0.5;
+  return D.seasons[0].season!==d.season||d.picks.length<=6*D.frs.length;
+}
+function draftData(metric,kind='rookie'){
+  const key='draft-'+kind+'-'+metric; if(D.prodMemo[key]) return D.prodMemo[key];
+  const picks=[];const drafts=[];
+  for(const s of D.seasons) for(const d of s.drafts){
+    if(d.status!=='complete'||isRookieDraft(d)!==(kind==='rookie')) continue;
+    drafts.push(d);
+    const from=Number(d.season)*100,wk=D.weekKeys.filter(k=>k>=from).length;
+    for(const p of d.picks){
+      if(!p.pid) continue;
+      let tot=0,own=0;
+      for(const e of D.st[p.pid]||[]) if(e.k>=from){const v=metric==='start'?e.p:e.t;tot+=v;if(e.rid===p.rid)own+=v}
+      const db=D.draftedBy[p.pid];
+      picks.push({start:d.start||0,season:d.season,round:p.r,no:p.no,label:db?.label||`${p.r}.${p.no}`,rid:p.rid,orig:db?.orig,pid:p.pid,tot,own,wk,ppw:wk?tot/wk:0,pos:P(p.pid)[1]});
+    }
+  }
+  // slot benchmark: least squares of points per week on log(overall pick)
+  const fit=picks.filter(x=>x.wk>=1);let a=0,b=0;
+  if(fit.length>=8){
+    const xs=fit.map(x=>Math.log(x.no)),ys=fit.map(x=>x.ppw),n=xs.length;
+    const mx=xs.reduce((s,v)=>s+v,0)/n,my=ys.reduce((s,v)=>s+v,0)/n;
+    const sxy=xs.reduce((s,v,i)=>s+(v-mx)*(ys[i]-my),0),sxx=xs.reduce((s,v)=>s+(v-mx)**2,0);
+    b=sxx?sxy/sxx:0;a=my-b*mx;
+  }else if(fit.length){a=fit.reduce((s,x)=>s+x.ppw,0)/fit.length}
+  const expOf=no=>Math.max(0,a+b*Math.log(no));
+  for(const x of picks){x.exp=expOf(x.no);x.voe=x.wk?x.ppw-x.exp:0;x.voeTot=x.voe*x.wk}
+  const teams=Math.max(...drafts.map(d=>Number(d.teams)||0),D.frs.length);
+  return D.prodMemo[key]={picks,drafts,expOf,teams,rounds:Math.max(0,...picks.map(x=>x.round))};
+}
+function renderDraft(){
+  const X=draftData(ui.metric);
+  if(!X.picks.length){$('#main').innerHTML='<h2 class="sec">Rookie drafts</h2><p class="status">No completed rookie drafts found for this league yet.</p>';return}
+  const sgn=v=>(v>0?'+':'')+fmt1(v);
+  const inS=x=>!ui.dSeason||x.season===ui.dSeason,inR=x=>!ui.dRound||String(x.round)===ui.dRound;
+  const P1=X.picks.filter(x=>inS(x)&&inR(x));
+  const rk={pw:{f:x=>x.voe,v:x=>sgn(x.voe)+'/wk',min:4,lbl:'Points above slot, per week'},tot:{f:x=>x.voeTot,v:x=>sgn(x.voeTot),min:1,lbl:'Points above slot, total'},raw:{f:x=>x.tot,v:x=>fmt1(x.tot),min:0,lbl:'Total points'}}[ui.dRank];
+  const elig=P1.filter(x=>x.wk>=rk.min);
+  const best=elig.slice().sort((a,b)=>rk.f(b)-rk.f(a)).slice(0,12);
+  const worst=elig.slice().sort((a,b)=>rk.f(a)-rk.f(b)).slice(0,12);
+  const tn=x=>esc(D.tname(x.season,x.rid).name);
+  const via=x=>x.orig!=null&&x.orig!==x.rid?` (via ${esc(D.tname(x.season,x.orig).name)})`:'';
+  const li=(x,val,small)=>`<li><span class="who">${playerChip(x.pid)}<small>${esc(x.label)} · ${x.season} · ${tn(x)}${via(x)}${small?' · '+small:''}</small></span><span class="num">${val}</span></li>`;
+  const empty='<li>Nothing here yet.</li>';
+
+  // drafter leaderboard
+  const lb=D.frs.map(f=>{const m=P1.filter(x=>x.rid===f.rid&&x.wk>0);
+    const sum=m.reduce((s,x)=>s+x.voe,0),tot=m.reduce((s,x)=>s+x.tot,0),own=m.reduce((s,x)=>s+x.own,0);
+    const srt=m.slice().sort((a,b)=>b.voe-a.voe);
+    return {f,n:m.length,hits:m.filter(x=>x.voe>0).length,sum,avg:m.length?sum/m.length:0,tot,kept:tot?own/tot:0,acq:m.filter(x=>x.orig!=null&&x.orig!==x.rid).length,best:srt[0],worst:srt[srt.length-1]}}).sort((a,b)=>b.sum-a.sum);
+
+  // round matrix
+  const rounds=range(1,X.rounds);
+  const PS=X.picks.filter(x=>inS(x)&&x.wk>0);
+  const cell=(rid,r)=>{const m=PS.filter(x=>x.rid===rid&&x.round===r);if(!m.length)return '<td><span class="cell self">·</span></td>';
+    const avg=m.reduce((s,x)=>s+x.voe,0)/m.length;const amt=Math.min(55,Math.round(Math.abs(avg)*6)+6);
+    return `<td><span class="cell" title="${m.length} pick${m.length>1?'s':''}" style="background:color-mix(in srgb,${avg>=0?'var(--win)':'var(--loss)'} ${amt}%,var(--sunk))">${sgn(avg)}<small class="cn"> ${m.length}</small></span></td>`};
+
+  // whiffs: first round, or top half of round 2 in small drafts
+  const whiffs=X.picks.filter(x=>inS(x)&&x.wk>=4&&x.no<=Math.ceil(X.teams*1.5)).sort((a,b)=>a.voeTot-b.voeTot).slice(0,10);
+  const fate=x=>{const cut=(D.movesByPid[x.pid]||[]).find(m=>m.status==='complete'&&m.drops.includes(x.pid));
+    return cut?`cut by ${esc(D.tname(cut.season,cut.rid).name)} ${wkLbl(cut)}`:D.holder[x.pid]!=null?'now on '+esc(frName(D.holder[x.pid])):'not rostered'};
+
+  // classes and positions
+  const classes=[...new Set(X.picks.map(x=>x.season))].sort().reverse().map(sea=>{const m=X.picks.filter(x=>x.season===sea&&x.wk>0);
+    return {sea,n:m.length,hit:m.length?m.filter(x=>x.voe>0).length/m.length:0,ppw:m.length?m.reduce((s,x)=>s+x.ppw,0)/m.length:0,top:m.slice().sort((a,b)=>b.tot-a.tot)[0]}});
+  const posL=['QB','RB','WR','TE'];
+  const pos=posL.map(ps=>{const m=P1.filter(x=>x.pos===ps&&x.wk>0);return {ps,n:m.length,hit:m.length?m.filter(x=>x.voe>0).length/m.length:0,avg:m.length?m.reduce((s,x)=>s+x.voe,0)/m.length:0,r1:m.filter(x=>x.round===1).length}}).filter(x=>x.n);
+
+  const bench=[1,Math.ceil(X.teams/2),X.teams,X.teams*2,X.teams*3].filter(n=>n<=X.rounds*X.teams).map(n=>`${Math.ceil(n/X.teams)}.${String(((n-1)%X.teams)+1).padStart(2,'0')}: ${fmt1(X.expOf(n))}`).join(' · ');
+  const seasons=[...new Set(X.picks.map(x=>x.season))].sort().reverse();
+
+  $('#main').innerHTML=`
+  <h2 class="sec">Rookie drafts</h2>
+  <p class="sub">Each pick is graded against its slot: how many points per week a typical pick at that spot has produced in this league, using your scoring. Per-week rates let older and newer draft classes compete fairly. Points count for whichever team rostered the player. Startup drafts are left out.</p>
+  <p class="note" style="margin:-8px 0 16px">Slot benchmark, pts per week (${METRIC_LBL[ui.metric].toLowerCase()}): ${bench}</p>
+  <div class="controls">
+    <label class="field"><span class="lbl">Draft</span><select id="dS"><option value="">All drafts</option>${seasons.map(x=>`<option ${x===ui.dSeason?'selected':''}>${x}</option>`).join('')}</select></label>
+    <label class="field"><span class="lbl">Round</span><select id="dR"><option value="">All rounds</option>${rounds.map(r=>`<option value="${r}" ${String(r)===ui.dRound?'selected':''}>Round ${r}</option>`).join('')}</select></label>
+    <label class="field"><span class="lbl">Rank picks by</span><select id="dK">${[['pw','Points above slot, per week'],['tot','Points above slot, total'],['raw','Total points']].map(([v,l])=>`<option value="${v}" ${ui.dRank===v?'selected':''}>${l}</option>`).join('')}</select></label>
+    <label class="field"><span class="lbl">Score by</span><select id="dM">${Object.entries(METRIC_LBL).map(([v,l])=>`<option value="${v}" ${ui.metric===v?'selected':''}>${l}</option>`).join('')}</select></label>
+  </div>
+  <h3 class="lbl" style="margin-bottom:8px">Best drafters</h3>
+  <div class="tblwrap"><table><thead><tr><th>Team</th><th class="r">Picks</th><th class="r">Hit rate</th><th class="r">Value added</th><th class="r">Avg per pick</th><th class="r">Total pts</th><th class="r">Kept for self</th><th class="r">Acquired picks</th><th>Best pick</th><th>Worst pick</th></tr></thead><tbody>
+  ${lb.map(r=>`<tr><td>${teamBlock(r.f)}</td><td class="r num">${r.n}</td><td class="r num">${r.n?Math.round(100*r.hits/r.n)+'%':'-'}</td><td class="r num ${r.sum>0?'w':r.sum<0?'l':''}">${sgn(r.sum)}/wk</td><td class="r num">${sgn(r.avg)}</td><td class="r num">${fmt1(r.tot)}</td><td class="r num">${r.tot?Math.round(100*r.kept)+'%':'-'}</td><td class="r num">${r.acq}</td><td>${r.best?esc(P(r.best.pid)[0])+` <span class="sub">${esc(r.best.label)} ${r.best.season}</span>`:'<span class="sub">None</span>'}</td><td>${r.worst&&r.n>1?esc(P(r.worst.pid)[0])+` <span class="sub">${esc(r.worst.label)} ${r.worst.season}</span>`:'<span class="sub">None</span>'}</td></tr>`).join('')}
+  </tbody></table></div>
+  <p class="note">Value added is the sum of each pick's points per week above its slot benchmark. Hit rate is the share of picks beating their slot. Kept for self is the share of those points scored for the team that made the pick.</p>
+  <h3 class="lbl" style="margin:24px 0 8px">Value above slot by round</h3>
+  <div class="tblwrap"><table class="matrix"><thead><tr><th class="rowh">Team</th>${rounds.map(r=>`<th>Round ${r}</th>`).join('')}</tr></thead><tbody>
+  ${D.frs.map(f=>`<tr><th class="rowh">${esc(f.name)}</th>${rounds.map(r=>cell(f.rid,r)).join('')}</tr>`).join('')}
+  <tr><th class="rowh">Best in round</th>${rounds.map(r=>{let bt=null,bv=-Infinity;for(const f of D.frs){const m=PS.filter(x=>x.rid===f.rid&&x.round===r);if(!m.length)continue;const v=m.reduce((s,x)=>s+x.voe,0)/m.length;if(v>bv){bv=v;bt=f}}return `<td class="sub">${bt?esc(bt.name.slice(0,12)):''}</td>`}).join('')}</tr>
+  </tbody></table></div>
+  <p class="note">Average points per week above slot for that team's picks in each round. The small number is how many picks.</p>
+  <div class="grid2">
+    <div class="panel"><h3>Best picks${ui.dRound?' in round '+ui.dRound:''}</h3><ul class="rank">${best.map(x=>li(x,rk.v(x),fmt1(x.ppw)+' pts/wk')).join('')||empty}</ul></div>
+    <div class="panel"><h3>Worst picks${ui.dRound?' in round '+ui.dRound:''}</h3><ul class="rank">${worst.map(x=>li(x,rk.v(x),fmt1(x.ppw)+' pts/wk')).join('')||empty}</ul></div>
+    <div class="panel"><h3>Biggest whiffs</h3><ul class="rank">${whiffs.map(x=>li(x,sgn(x.voeTot),`${fmt1(x.ppw)} vs ${fmt1(x.exp)} expected per wk · ${fate(x)}`)).join('')||empty}</ul><p class="note">First-round and early second-round picks, ranked by total points below their slot.</p></div>
+    <div class="panel"><h3>Draft classes</h3><ul class="rank">${classes.map(c=>`<li><span class="who"><span class="trophy">${c.sea}</span> ${c.top?'Top pick: '+esc(P(c.top.pid)[0])+` (${esc(c.top.label)})`:''}<small>${c.n} picks · ${Math.round(100*c.hit)}% beat their slot</small></span><span class="num">${fmt1(c.ppw)}/wk</span></li>`).join('')}</ul><p class="note">Average points per week per pick in each class.</p></div>
+    <div class="panel"><h3>Hit rate by position</h3><ul class="rank">${pos.map(x=>`<li><span class="who"><span class="pos ${x.ps}">${x.ps}</span> ${x.n} picks<small>${x.r1} in round 1 · avg ${sgn(x.avg)}/wk above slot</small></span><span class="num">${Math.round(100*x.hit)}%</span></li>`).join('')||empty}</ul></div>
+  </div>`;
+  $('#dS').onchange=e=>{ui.dSeason=e.target.value;renderDraft()};
+  $('#dR').onchange=e=>{ui.dRound=e.target.value;renderDraft()};
+  $('#dK').onchange=e=>{ui.dRank=e.target.value;renderDraft()};
+  $('#dM').onchange=e=>{ui.metric=e.target.value;renderDraft()};
+}
+
+function renderStartup(){
+  const X=draftData(ui.metric,'startup');
+  if(!X.picks.length){$('#main').innerHTML='<h2 class="sec">Startup draft</h2><p class="status">No startup draft found. This league may have been created before its Sleeper history begins, or it started as a redraft league.</p>';return}
+  const sgn=v=>(v>0?'+':'')+fmt1(v);
+  const inS=x=>!ui.sSeason||x.season===ui.sSeason,inR=x=>!ui.sRound||String(x.round)===ui.sRound,inT=x=>!ui.sTeam||String(x.rid)===ui.sTeam;
+  const all=X.picks.filter(inS);
+  for(const x of all){
+    const left=(D.leaves[x.pid]||[]).some(e=>e.rid===x.rid&&e.created>x.start);
+    const h=D.holder[x.pid];
+    x.status=h===x.rid?(left?'back':'kept'):(h!=null?'gone':'free');
+  }
+  const P1=all.filter(x=>inR(x)&&inT(x));
+  const rk={pw:{f:x=>x.voe,v:x=>sgn(x.voe)+'/wk',min:4},tot:{f:x=>x.voeTot,v:x=>sgn(x.voeTot),min:1},raw:{f:x=>x.tot,v:x=>fmt1(x.tot),min:0}}[ui.sRank];
+  const elig=P1.filter(x=>x.wk>=rk.min);
+  const best=elig.slice().sort((a,b)=>rk.f(b)-rk.f(a)).slice(0,12);
+  const worst=elig.slice().sort((a,b)=>rk.f(a)-rk.f(b)).slice(0,12);
+  const half=Math.ceil(X.rounds/2);
+  const gems=all.filter(x=>inT(x)&&x.round>half&&x.wk>=4).sort((a,b)=>b.voe-a.voe).slice(0,10);
+  const busts=all.filter(x=>inT(x)&&x.round<=2&&x.wk>=4).sort((a,b)=>a.voeTot-b.voeTot).slice(0,10);
+  const traded=all.filter(inT).map(x=>({x,n:(D.playerTrades[x.pid]||[]).filter(i=>D.trades[i].created>x.start).length})).filter(y=>y.n>0).sort((a,b)=>b.n-a.n).slice(0,10);
+  const kept=all.filter(x=>inT(x)&&(x.status==='kept'||x.status==='back')).sort((a,b)=>b.own-a.own);
+  const tn=x=>esc(D.tname(x.season,x.rid).name);
+  const stLbl={kept:'never left',back:'traded or cut, then reacquired',gone:'now on ',free:'not on a roster'};
+  const where=x=>x.status==='gone'?'now on '+esc(frName(D.holder[x.pid])):stLbl[x.status];
+  const li=(x,val,small)=>`<li><span class="who">${playerChip(x.pid)}<small>${esc(x.label)} · ${tn(x)}${small?' · '+small:''}</small></span><span class="num">${val}</span></li>`;
+  const empty='<li>Nothing here yet.</li>';
+
+  const tbl=D.frs.map(f=>{const m=all.filter(x=>x.rid===f.rid);const sc=m.filter(x=>x.wk>0);
+    const still=m.filter(x=>x.status==='kept'||x.status==='back').length;
+    const srt=sc.slice().sort((a,b)=>b.voe-a.voe);
+    return {f,n:m.length,still,never:m.filter(x=>x.status==='kept').length,free:m.filter(x=>x.status==='free').length,own:m.reduce((s,x)=>s+x.own,0),sum:sc.reduce((s,x)=>s+x.voe,0),best:srt[0],worst:srt[srt.length-1]}}).sort((a,b)=>b.sum-a.sum);
+  const strat=D.frs.map(f=>({f,first:all.filter(x=>x.rid===f.rid).sort((a,b)=>a.no-b.no).slice(0,6)}));
+  const posMix=['QB','RB','WR','TE'];
+  const seasons=[...new Set(X.picks.map(x=>x.season))].sort().reverse();
+  const bench=[1,X.teams,X.teams*3,X.teams*6,X.teams*10].filter(n=>n<=X.rounds*X.teams).map(n=>`${Math.ceil(n/X.teams)}.${String(((n-1)%X.teams)+1).padStart(2,'0')}: ${fmt1(X.expOf(n))}`).join(' · ');
+
+  $('#main').innerHTML=`
+  <h2 class="sec">Startup draft</h2>
+  <p class="sub">The draft that built the league. Picks are graded against their slot the same way rookie picks are, using a benchmark built from this draft alone. Points per week run from the startup season to today, so veterans who faded or retired count against their pick.</p>
+  <p class="note" style="margin:-8px 0 16px">Slot benchmark, pts per week: ${bench}</p>
+  <div class="controls">
+    ${seasons.length>1?`<label class="field"><span class="lbl">Draft</span><select id="sS"><option value="">All</option>${seasons.map(x=>`<option ${x===ui.sSeason?'selected':''}>${x}</option>`).join('')}</select></label>`:''}
+    <label class="field"><span class="lbl">Team</span><select id="sT"><option value="">All teams</option>${D.frs.map(f=>`<option value="${f.rid}" ${String(f.rid)===ui.sTeam?'selected':''}>${esc(f.name)}</option>`).join('')}</select></label>
+    <label class="field"><span class="lbl">Round</span><select id="sR"><option value="">All rounds</option>${range(1,X.rounds).map(r=>`<option value="${r}" ${String(r)===ui.sRound?'selected':''}>Round ${r}</option>`).join('')}</select></label>
+    <label class="field"><span class="lbl">Rank picks by</span><select id="sK">${[['pw','Points above slot, per week'],['tot','Points above slot, total'],['raw','Total points']].map(([v,l])=>`<option value="${v}" ${ui.sRank===v?'selected':''}>${l}</option>`).join('')}</select></label>
+    <label class="field"><span class="lbl">Score by</span><select id="sM">${Object.entries(METRIC_LBL).map(([v,l])=>`<option value="${v}" ${ui.metric===v?'selected':''}>${l}</option>`).join('')}</select></label>
+  </div>
+  <div class="tblwrap"><table><thead><tr><th>Team</th><th class="r">Picks</th><th class="r">Still on team</th><th class="r">Never left</th><th class="r">Off all rosters</th><th class="r">Pts for drafting team</th><th class="r">Value added</th><th>Best pick</th><th>Worst pick</th></tr></thead><tbody>
+  ${tbl.map(r=>`<tr><td>${teamBlock(r.f)}</td><td class="r num">${r.n}</td><td class="r num">${r.still} <span class="sub">(${r.n?Math.round(100*r.still/r.n):0}%)</span></td><td class="r num">${r.never}</td><td class="r num">${r.free}</td><td class="r num">${fmt1(r.own)}</td><td class="r num ${r.sum>0?'w':r.sum<0?'l':''}">${sgn(r.sum)}/wk</td><td>${r.best?esc(P(r.best.pid)[0])+` <span class="sub">${esc(r.best.label)}</span>`:'<span class="sub">None</span>'}</td><td>${r.worst&&r.n>1?esc(P(r.worst.pid)[0])+` <span class="sub">${esc(r.worst.label)}</span>`:'<span class="sub">None</span>'}</td></tr>`).join('')}
+  </tbody></table></div>
+  <p class="note">Still on team includes players who left and were brought back. Off all rosters usually means the player retired or stopped being useful. Value added sums each pick's points per week above its slot.</p>
+  <div class="grid2">
+    <div class="panel"><h3>Still on original team${ui.sTeam?'':' (all teams)'}</h3><ul class="rank">${kept.slice(0,ui.sTeam?60:15).map(x=>li(x,fmt1(x.own),stLbl[x.status])).join('')||empty}</ul><p class="note">Value is points scored for the team that drafted him.${!ui.sTeam&&kept.length>15?' Pick a team to see its full list.':''}</p></div>
+    <div class="panel"><h3>Best picks${ui.sRound?' in round '+ui.sRound:''}</h3><ul class="rank">${best.map(x=>li(x,rk.v(x),fmt1(x.ppw)+' pts/wk')).join('')||empty}</ul></div>
+    <div class="panel"><h3>Worst picks${ui.sRound?' in round '+ui.sRound:''}</h3><ul class="rank">${worst.map(x=>li(x,rk.v(x),fmt1(x.ppw)+' pts/wk')).join('')||empty}</ul></div>
+    <div class="panel"><h3>Late-round gems</h3><ul class="rank">${gems.filter(x=>x.voe>0).map(x=>li(x,sgn(x.voe)+'/wk',where(x))).join('')||empty}</ul><p class="note">Best picks from round ${half+1} on.</p></div>
+    <div class="panel"><h3>Biggest busts</h3><ul class="rank">${busts.filter(x=>x.voeTot<0).map(x=>li(x,sgn(x.voeTot),`${fmt1(x.ppw)} vs ${fmt1(x.exp)} expected per wk · ${where(x)}`)).join('')||empty}</ul><p class="note">First and second round picks, by total points below their slot.</p></div>
+    <div class="panel"><h3>Most traded startup players</h3><ul class="rank">${traded.map(y=>li(y.x,y.n+'x',where(y.x))).join('')||empty}</ul></div>
+  </div>
+  <h3 class="lbl" style="margin:24px 0 8px">Draft strategy: each team's first six picks</h3>
+  <div class="tblwrap"><table><thead><tr><th>Team</th>${range(1,6).map(i=>`<th>Pick ${i}</th>`).join('')}<th>Mix</th></tr></thead><tbody>
+  ${strat.map(r=>`<tr><td>${esc(r.f.name)}</td>${range(0,5).map(i=>{const x=r.first[i];if(!x)return '<td></td>';const [n,pos]=P(x.pid);return `<td><span class="pos ${esc(pos)}">${esc(pos)}</span> ${esc(n)} <span class="sub">${esc(x.label)}</span></td>`}).join('')}<td class="sub">${posMix.map(ps=>{const c=r.first.filter(x=>x.pos===ps).length;return c?`${c} ${ps}`:''}).filter(Boolean).join(', ')}</td></tr>`).join('')}
+  </tbody></table></div>`;
+  const on=(id,k)=>{const el=$(id);if(el)el.onchange=e=>{ui[k]=e.target.value;renderStartup()}};
+  on('#sS','sSeason');on('#sT','sTeam');on('#sR','sRound');on('#sK','sRank');on('#sM','metric');
+}
+
 function record(rid,opp,po){
   let w=0,l=0,t=0,pf=0,pa=0;const list=[];
   for(const g of D.games){
@@ -858,11 +1040,11 @@ function closeDrawer(){stack.length=0;$('#drawerRoot').innerHTML=''}
 /* ---------- routing & events ---------- */
 function route(){
   const h=location.hash.slice(1);
-  view=['trades','rank','wire','h2h','history','week'].includes(h)?h:'trades';
+  view=['trades','rank','wire','draft','startup','h2h','history','week'].includes(h)?h:'trades';
   document.querySelectorAll('.tab').forEach(t=>t.setAttribute('aria-selected',t.dataset.view===view));
   if(!D) return;
   if(view!=='week') clearInterval(liveTimer);
-  ({trades:renderTrades,rank:renderRankings,wire:renderWire,h2h:renderH2H,history:renderHistory,week:renderWeek})[view]();
+  ({trades:renderTrades,rank:renderRankings,wire:renderWire,draft:renderDraft,startup:renderStartup,h2h:renderH2H,history:renderHistory,week:renderWeek})[view]();
 }
 window.addEventListener('hashchange',route);
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{location.hash=t.dataset.view});
